@@ -1,149 +1,79 @@
 """
-Leveraged ETF Momentum System - Baseline Version
-================================================
-Parameters:
-  - Fast Momentum Lookback: 11 Days (Weight: 0.75)
-  - Slow Momentum Lookback: 48 Days (Weight: 0.25)
-  - Universe: TQQQ, SOXL, FNGU, UPRO
-  - Regime Filters: SMA55, Hurst Ensemble, Credit Veto (HYG/IEF), VIX Volatility
-  - Risk Management: Dynamic Position Sizing (ATR), Trailing Stops
+Leveraged ETF Momentum Dashboard
+Neue Baseline: SMA55 | DynStop | DipAlloc100% | DynPos 0.022
+               Hurst-Ensemble w100/t0.50 AND w30/t0.46
+               Credit-Veto HYG/IEF ma50/d2.5%
+               atr_lo=2.5% | atr_hi=5.5%
+               Momentum-Rotation: 11/48 Tage mit (0.75, 0.25)
 """
 
-import subprocess, sys
-subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", "-q", "yfinance", "curl_cffi"], check=False)
-
+import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from datetime import datetime
-import warnings, time
-
+from datetime import datetime, timedelta
+import warnings
 warnings.filterwarnings("ignore")
-np.random.seed(42)
 
-# ── SYSTEM CONFIGURATION ──────────────────────────────────────────────────
-START_DATE = "1998-01-01"
-END_DATE   = datetime.today().strftime("%Y-%m-%d")
+st.set_page_config(
+    page_title="ETF Momentum Dashboard",
+    page_icon="📊",
+    layout="centered",
+    initial_sidebar_state="collapsed",
+)
 
-TRADING_COST = 0.0025  # 0.25% Spread + Slippage + Fee
-TRACKING_ERR = 0.0012  # Daily Tracking Error Noise
-ER_COST = {"TQQQ": 0.0086, "SOXL": 0.0095, "FNGU": 0.0095, "UPRO": 0.0091}
-ETF_LIST = ["TQQQ", "SOXL", "FNGU", "UPRO"]
+# ── PARAMETER ──────────────────────────────────────────────────────────────
+SMA_PERIOD   = 55
+ATR_PERIOD   = 14
+ATR_LO       = 2.5
+ATR_HI       = 5.5
+DYN_BASE     = 0.022
 
-# Baseline Momentum Setup
-MOM_LOOKBACKS = [11, 48]
-MOM_WEIGHTS   = [0.75, 0.25]
+DS_ATR_LO    = 1.8
+DS_ATR_HI    = 3.0
+DS_STOP_LO   = 0.21
+DS_STOP_MID  = 0.14
+DS_STOP_HI   = 0.09
 
-REQUIRED_TICKERS = {
-    "QQQ": "QQQ", "NDX": "^NDX", "SPY": "SPY", "SOXX": "SOXX", "SMH": "SMH",
-    "VIX": "^VIX", "TQQQ": "TQQQ", "SOXL": "SOXL", "UPRO": "UPRO",
-    "HYG": "HYG", "IEF": "IEF",
-    "AAPL": "AAPL", "MSFT": "MSFT", "GOOGL": "GOOGL",
-    "AMZN": "AMZN", "NVDA": "NVDA", "META": "META", "TSLA": "TSLA",
-}
+LOCK_RECOV   = 0.08
+DIP_TRIGGER  = 0.42
+DIP_ALLOC    = 1.00
 
-# ── 1. DATA DOWNLOADING & PREPARATION ─────────────────────────────────────
-print("1/4: Lade und bereinige Marktdaten...")
-close_data, high_data, low_data = {}, {}, {}
+# Neue Sieger-Baseline Momentum-Gewichtung (11/48)
+MTF_WINDOWS  = (11, 48)
+MTF_WEIGHTS  = (0.75, 0.25)
 
-def yf_download_retry(ticker, start, end, retries=3):
-    for attempt in range(retries):
+HURST_W1, HURST_T1 = 100, 0.50
+HURST_W2, HURST_T2 = 30, 0.46
+
+CREDIT_MA    = 50
+CREDIT_DEPTH = 0.025
+
+UNIVERSE = ["TQQQ", "SOXL", "FNGU", "UPRO"]
+
+
+# ── DATEN (gecacht, 1h) ────────────────────────────────────────────────────
+@st.cache_data(ttl=3600)
+def load_data():
+    end   = datetime.today()
+    # Erweitert auf 730 Tage (2 Jahre) für stabile Historie
+    start = end - timedelta(days=730)
+
+    def dl(ticker):
         try:
-            df = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
-            if df is not None and not df.empty: 
-                return df
-        except Exception: 
-            pass
-        time.sleep(1)
-    return None
+            df = yf.download(ticker, start=start.strftime("%Y-%m-%d"),
+                             end=end.strftime("%Y-%m-%d"),
+                             auto_adjust=True, progress=False)
+            return df if not df.empty else None
+        except Exception:
+            return None
 
-for name, ticker in REQUIRED_TICKERS.items():
-    df = yf_download_retry(ticker, START_DATE, END_DATE)
-    if df is not None and not df.empty:
-        close_data[name] = df["Close"].squeeze()
-        if "High" in df: high_data[name] = df["High"].squeeze()
-        if "Low"  in df: low_data[name]  = df["Low"].squeeze()
+    data = {}
+    for key in ["QQQ", "^VIX", "HYG", "IEF"] + UNIVERSE:
+        data[key] = dl(key)
+    return data
 
-RC = pd.DataFrame(close_data).ffill()
-RH = pd.DataFrame(high_data).ffill()
-RL = pd.DataFrame(low_data).ffill()
 
-# History Extension QQQ via NDX
-if "NDX" in RC and "QQQ" in RC:
-    fvi = RC["QQQ"].first_valid_index()
-    if fvi:
-        ratio = RC["QQQ"].loc[fvi] / RC["NDX"].loc[fvi]
-        RC["QQQ"] = RC["QQQ"].combine_first(RC["NDX"] * ratio)
-
-# History Extension Semi Sector
-RC["SEMI"] = RC.get("SMH", RC["QQQ"])
-if "SOXX" in RC and "SMH" in RC:
-    fvi = RC["SOXX"].first_valid_index()
-    if fvi:
-        ratio = RC["SOXX"].loc[fvi] / RC["SMH"].loc[fvi]
-        RC["SEMI"] = RC["SOXX"].combine_first(RC["SMH"] * ratio)
-
-mag7 = [c for c in ["AAPL","MSFT","GOOGL","AMZN","NVDA","META","TSLA"] if c in RC]
-mag7p = (1 + RC[mag7].pct_change().mean(axis=1)).cumprod() * 100
-
-def synth3x(base, er, real=None, real_from=None, seed=0):
-    np.random.seed(seed)
-    r = base.pct_change().fillna(0)
-    lev = 3 * r - er / 252 + np.random.normal(0, TRACKING_ERR, len(r))
-    s = pd.Series((1 + lev).cumprod() * 100, index=base.index)
-    if real is not None and real_from is not None:
-        ra = real.reindex(s.index).ffill()
-        fvi = ra.first_valid_index()
-        if fvi and fvi in s.index: 
-            s *= ra.loc[fvi] / s.loc[fvi]
-        mask = ra.notna() & (ra.index >= pd.Timestamp(real_from))
-        s[mask] = ra[mask]
-    return s
-
-def reb_flags(idx, wd=3): # Rebalance Wednesday
-    f = pd.Series(False, index=idx)
-    wg = {}
-    for d in idx:
-        k = (d.year, d.isocalendar()[1])
-        if k not in wg: wg[k] = []
-        wg[k].append(d)
-    for k, wdl in wg.items():
-        ww = [d.weekday() for d in wdl]
-        if wd in ww: 
-            f[wdl[ww.index(wd)]] = True
-        else:
-            later = [d for d in wdl if d.weekday() > wd]
-            if later: f[later[0]] = True
-            elif wdl: f[wdl[-1]] = True
-    return f
-
-ETFS = pd.DataFrame({
-    "TQQQ": synth3x(RC["QQQ"], ER_COST["TQQQ"], RC.get("TQQQ"), "2010-02-11", 1),
-    "SOXL": synth3x(RC["SEMI"], ER_COST["SOXL"], RC.get("SOXL"), "2010-03-03", 2),
-    "FNGU": synth3x(mag7p, ER_COST["FNGU"], seed=3),
-    "UPRO": synth3x(RC["SPY"], ER_COST["UPRO"], RC.get("UPRO"), "2009-06-25", 4),
-})
-VIX_S = RC.get("VIX", pd.Series(15.0, index=RC.index))
-DF    = pd.DataFrame({"QQQ": RC["QQQ"], "VIX": VIX_S}).join(ETFS, how="inner")
-DO    = reb_flags(DF.index, 3)
-N     = len(DF)
-
-qqqp = DF["QQQ"].values
-qqqh_raw = RH.get("QQQ", RC["QQQ"]).reindex(DF.index).ffill().values
-qqql_raw = RL.get("QQQ", RC["QQQ"]).reindex(DF.index).ffill().values
-qqqh = np.where(np.isnan(qqqh_raw), qqqp, qqqh_raw)
-qqql = np.where(np.isnan(qqql_raw), qqqp, qqql_raw)
-
-# ── 2. REGIME & INDICATOR CALCULATIONS ────────────────────────────────────
-print("2/4: Berechne Filter & Indikatoren...")
-
-# Credit Signal Veto
-CREDIT = (RC["HYG"] / RC["IEF"]).reindex(DF.index).ffill() if ("HYG" in RC and "IEF" in RC) else pd.Series(1.0, index=DF.index)
-cma = CREDIT.rolling(50).mean()
-credit_arr = (CREDIT < cma * (1 - 0.025)).fillna(False).values
-
-# Hurst Exponent Ensemble (Choppiness)
-log_ret = np.log(DF["QQQ"] / DF["QQQ"].shift(1)).fillna(0).values
 def hurst_rs(x):
     n = len(x)
     if n < 20: return 0.5
@@ -152,12 +82,12 @@ def hurst_rs(x):
     for lag in lags:
         if lag < 2: continue
         nseg = n // lag
+        if nseg < 1: continue
         rs_seg = []
         for k in range(nseg):
             seg = x[k*lag:(k+1)*lag]
-            dev = np.cumsum(seg - seg.mean())
-            R = dev.max() - dev.min()
-            S = seg.std()
+            mean = seg.mean(); dev = np.cumsum(seg - mean)
+            R = dev.max() - dev.min(); S = seg.std()
             if S > 0: rs_seg.append(R / S)
         if rs_seg: rs_pts.append((lag, np.mean(rs_seg)))
     if len(rs_pts) < 2: return 0.5
@@ -165,178 +95,280 @@ def hurst_rs(x):
     ly = np.log([p[1] for p in rs_pts])
     return float(np.clip(np.polyfit(lx, ly, 1)[0], 0.0, 1.0))
 
-h1 = np.nan_to_num(pd.Series(log_ret).rolling(100).apply(hurst_rs, raw=True).values, nan=0.5)
-h2 = np.nan_to_num(pd.Series(log_ret).rolling(30).apply(hurst_rs, raw=True).values, nan=0.5)
-chop = (h1 < 0.50) & (h2 < 0.46)
 
-vix_arr = DF["VIX"].fillna(15.0).values
-etf_arr = {e: DF[e].values for e in ETF_LIST if e in DF.columns}
-do_arr  = DO.reindex(DF.index).values.astype(bool)
+def compute_signal():
+    data = load_data()
+    qqq_df = data.get("QQQ")
+    if qqq_df is None or qqq_df.empty:
+        return None
 
-# Trend & Volatility (SMA55 + ATR)
-cs = np.concatenate([[0.0], np.cumsum(qqqp)])
-sma = np.full(N, np.nan)
-sma[54:] = (cs[55:] - cs[:N-54]) / 55
+    qqq = qqq_df["Close"].squeeze()
+    qhi_raw = qqq_df["High"].squeeze() if "High" in qqq_df.columns else qqq
+    qlo_raw = qqq_df["Low"].squeeze()  if "Low"  in qqq_df.columns else qqq
+    qhi = qhi_raw.where(qhi_raw.notna(), qqq)
+    qlo = qlo_raw.where(qlo_raw.notna(), qqq)
 
-pc = np.concatenate([[qqqp[0]], qqqp[:-1]])
-tr = np.maximum(qqqh - qqql, np.maximum(np.abs(qqqh - pc), np.abs(qqql - pc)))
-al = 2.0 / 15.0
-atr = np.zeros(N)
-atr[0] = tr[0]
-for i in range(1, N): atr[i] = al * tr[i] + (1 - al) * atr[i-1]
-atr_pct = np.where(qqqp > 0, atr / qqqp * 100.0, 2.0)
+    vix_df = data.get("^VIX")
+    vix = vix_df["Close"].squeeze() if vix_df is not None else pd.Series(15.0, index=qqq.index)
 
-assets = dict(etf_arr)
-assets["QQQ1X"] = qqqp
+    etf_close = {}
+    for t in UNIVERSE:
+        if data.get(t) is not None and not data[t].empty:
+            etf_close[t] = data[t]["Close"].squeeze()
 
-# ── 3. CORE SYSTEM SIMULATION ─────────────────────────────────────────────
-print("3/4: Führe Simulation aus...")
+    # SMA & ATR
+    sma = qqq.rolling(SMA_PERIOD).mean()
+    pc  = qqq.shift(1)
+    tr  = pd.concat([qhi - qlo, (qhi - pc).abs(), (qlo - pc).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(com=ATR_PERIOD - 1, adjust=False).mean()
+    atr_pct = (atr / qqq * 100).fillna(2.0)
 
-def get_momentum(e, i):
-    arr = assets.get(e)
-    if arr is None: return -99.0
-    s = 0.0
-    for w_, lb_ in zip(MOM_WEIGHTS, MOM_LOOKBACKS):
-        j = max(0, i - lb_)
-        p0 = arr[j]; p1 = arr[i]
-        if p0 > 0: s += w_ * (p1 / p0 - 1)
-    return s
+    date    = qqq.index[-1]
+    qqq_now = float(qqq.iloc[-1])
+    sma_now = float(sma.iloc[-1])
+    atr_now = float(atr_pct.iloc[-1])
+    vix_now = float(vix.reindex(qqq.index).ffill().iloc[-1])
+    px_bull = qqq_now >= sma_now
 
-def dyn_position(i):
-    a = atr_pct[i]
-    return min(1.0, 0.022 / (a / 100.0)) if a > 0 else 1.0
+    # DynStop-Regime
+    if atr_now < DS_ATR_LO:
+        stop_pct, stop_regime = DS_STOP_LO, "RUHIG"
+    elif atr_now > DS_ATR_HI:
+        stop_pct, stop_regime = DS_STOP_HI, "VOLATIL"
+    else:
+        stop_pct, stop_regime = DS_STOP_MID, "NORMAL"
 
-def exit_stop_pct(i):
-    a = atr_pct[i]
-    if a < 1.8: return 0.21
-    if a > 3.0: return 0.09
-    return 0.14
+    # ATR-Hauptregime
+    if atr_now > ATR_HI:
+        atr_regime = "DEFENSIV"
+    elif atr_now > ATR_LO:
+        atr_regime = "ERHÖHT"
+    else:
+        atr_regime = "AGGRESSIV"
 
-def get_vix_regime(i, vx):
-    a = atr_pct[i]
-    if a > 5.5: return 0
-    if a > 2.5:
-        if vx >= 40: return 1
-        if vx >= 28: return 2
-        if vx >= 20: return 3
-    return 4
+    dyn_pos = min(1.0, DYN_BASE / (atr_now / 100.0)) if atr_now > 0 else 1.0
 
-def get_best_asset(i, soxl_stopped_out):
-    cands = [e for e in ETF_LIST if not (e == "SOXL" and soxl_stopped_out)]
-    if not cands: cands = ["TQQQ"]
-    sc = {e: get_momentum(e, i) for e in cands}
-    neg = all(x < 0 for x in sc.values())
-    rnk = sorted(sc.items(), key=lambda x: x[1], reverse=True)
-    return rnk, sc, neg
+    # Hurst-Ensemble
+    log_ret = np.log(qqq / qqq.shift(1)).dropna().values
+    h1 = hurst_rs(log_ret[-HURST_W1:]) if len(log_ret) >= HURST_W1 else 0.5
+    h2 = hurst_rs(log_ret[-HURST_W2:]) if len(log_ret) >= HURST_W2 else 0.5
+    hurst_chop = (h1 < HURST_T1) and (h2 < HURST_T2)
 
-port = 1.0; pos = {}; cur = None; trail = {}
-phase = "BEAR"; bear_entry_px = None; dip_bought = False; soxl_stop = None
-portfolio_history = np.ones(N)
+    # Kredit-Signal
+    credit_ok = data.get("HYG") is not None and data.get("IEF") is not None
+    ratio_now = ma_now = credit_dist = None
+    credit_stress = False
+    if credit_ok:
+        hyg   = data["HYG"]["Close"].squeeze()
+        ief   = data["IEF"]["Close"].squeeze()
+        ratio = (hyg / ief).reindex(qqq.index).ffill()
+        ratio_ma  = ratio.rolling(CREDIT_MA).mean()
+        ratio_now = float(ratio.iloc[-1])
+        ma_now    = float(ratio_ma.iloc[-1])
+        threshold = ma_now * (1 - CREDIT_DEPTH)
+        credit_stress = ratio_now < threshold
+        credit_dist   = (ratio_now / threshold - 1) * 100 if threshold > 0 else 0
 
-def apply_trade(new_pos):
-    global port, pos, cur
-    turnover = sum(abs(new_pos.get(k, 0) - pos.get(k, 0)) for k in set(pos) | set(new_pos))
-    port *= (1 - turnover * TRADING_COST * 0.5)
-    pos = {k: w for k, w in new_pos.items() if abs(w) > 1e-4}
-    cur = max(pos, key=pos.get) if pos else None
+    is_bull = px_bull and not credit_stress
 
-for i in range(N):
-    q = qqqp[i]; sm = sma[i]; vx = vix_arr[i] if not np.isnan(vix_arr[i]) else 15.0
+    # Momentum-Scores (11 / 48)
+    ww_total = sum(MTF_WEIGHTS)
+    scores = {}
+    for name, series in etf_close.items():
+        s = 0.0
+        for w, lb in zip(MTF_WEIGHTS, MTF_WINDOWS):
+            if len(series) > lb:
+                p0 = float(series.iloc[-1 - lb])
+                p1 = float(series.iloc[-1])
+                if p0 > 0: s += (w / ww_total) * (p1 / p0 - 1)
+        scores[name] = s
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+    best   = ranked[0][0] if ranked else "TQQQ"
 
-    if i > 0:
-        port *= 1.0 + sum(pos.get(e, 0) * (assets[e][i] / assets[e][i-1] - 1)
-                          for e in pos if e in assets and assets[e][i-1] > 0
-                          and abs(pos.get(e, 0)) > 1e-5)
-    portfolio_history[i] = max(port, 0.001)
+    # Korrigierte Trailing-Stop-Logik
+    above        = qqq >= sma
+    cross        = above & ~above.shift(1).fillna(False)
+    bull_entries = cross[cross].index
+    last_entry   = bull_entries[-1] if len(bull_entries) > 0 else qqq.index[0]
 
-    soxl_sl_active = False
-    if soxl_stop and "SOXL" in assets:
-        cp = assets["SOXL"][i]
-        if cp > 0:
-            if cp / soxl_stop - 1 >= 0.08: soxl_stop = None
-            else: soxl_sl_active = True
+    def calc_stop(name):
+        if name not in etf_close: return None
+        s = etf_close[name].dropna()
+        if s.empty: return None
 
-    px_bull = (q >= sm) if not np.isnan(sm) else True
-    bull = px_bull and not bool(credit_arr[i])
+        since = s.loc[s.index >= last_entry]
+        if since.empty:
+            since = s.tail(126) # Fallback
 
-    if phase != "BEAR" and not bull:
-        bear_entry_px = q; dip_bought = False; trail = {}; apply_trade({}); phase = "BEAR"
+        peak     = float(since.max())
+        peak_d   = since.idxmax()
+        cur      = float(s.iloc[-1])
+        stop     = peak * (1 - stop_pct)
+        dist     = (cur - stop) / cur if cur > 0 else 0
+        stopped  = cur < stop
+        reentry  = stop * (1 + LOCK_RECOV)
 
-    if phase == "BEAR":
-        if not bull and bear_entry_px and not dip_bought:
-            if q / bear_entry_px - 1 <= -0.42:
-                apply_trade({"TQQQ": 1.00}); dip_bought = True
-        if bull:
-            ps = dyn_position(i)
-            rnk, sc, neg = get_best_asset(i, soxl_sl_active)
-            best_e = rnk[0][0]
-            apply_trade({best_e: min(1.0, ps * (0.5 if neg else 1.0))})
-            phase = "BULL"; trail = {best_e: assets.get(best_e, portfolio_history)[i]}; dip_bought = False
-        continue
+        return {"cur": cur, "peak": peak, "peak_date": peak_d,
+                "stop": stop, "dist": dist,
+                "stopped": stopped, "reentry": reentry}
 
-    phase = "BULL"; ps = dyn_position(i); sp = exit_stop_pct(i)
+    return dict(
+        date=date, qqq_now=qqq_now, sma_now=sma_now,
+        atr_now=atr_now, atr_regime=atr_regime, vix_now=vix_now,
+        px_bull=px_bull, is_bull=is_bull,
+        stop_pct=stop_pct, stop_regime=stop_regime, dyn_pos=dyn_pos,
+        h1=h1, h2=h2, hurst_chop=hurst_chop,
+        credit_ok=credit_ok, ratio_now=ratio_now, ma_now=ma_now,
+        credit_dist=credit_dist, credit_stress=credit_stress,
+        scores=scores, ranked=ranked, best=best, etf_close=etf_close,
+        last_entry=last_entry,
+        stops={"SOXL": calc_stop("SOXL"), "FNGU": calc_stop("FNGU")},
+    )
 
-    if chop[i]:
-        target = {"QQQ1X": min(1.0, ps)}
-        if target != pos: apply_trade(target)
-        continue
 
-    reg = get_vix_regime(i, vx)
-    if reg == 0:
-        target = {"TQQQ": min(1.0, ps)}
-        if target != pos: apply_trade(target)
-        continue
-    if reg == 1:
-        target = {"TQQQ": min(0.60, ps * 0.60)}
-        if target != pos: apply_trade(target)
-        continue
-    if reg in (2, 3):
-        target = {"TQQQ": min(1.0, ps)}
-        if abs(pos.get("TQQQ", 0) - target.get("TQQQ", 0)) > 0.05: apply_trade(target)
-        continue
+# ── UI ─────────────────────────────────────────────────────────────────────
+st.title("📊 ETF Momentum Dashboard")
 
-    stop_hit = False
-    for et in ["SOXL", "FNGU"]:
-        if pos.get(et, 0) > 0.05 and et in assets:
-            cp = assets[et][i]
-            if cp > 0:
-                trail[et] = max(trail.get(et, cp), cp)
-                if cp / trail[et] - 1 <= -sp:
-                    apply_trade({"TQQQ": min(1.0, ps)})
-                    trail = {"TQQQ": assets.get("TQQQ", portfolio_history)[i]}
-                    if et == "SOXL": soxl_stop = cp
-                    stop_hit = True; break
-    if stop_hit: continue
+col_a, col_b = st.columns([3, 1])
+with col_b:
+    if st.button("🔄 Aktualisieren"):
+        st.cache_data.clear()
+        st.rerun()
 
-    if bool(do_arr[i]) or cur is None:
-        rnk, sc, neg = get_best_asset(i, soxl_sl_active)
-        best_e = rnk[0][0]
-        if cur and cur != best_e:
-            thr = 0.02 if best_e == "SOXL" else 0.05
-            if sc.get(best_e, 0) - sc.get(cur, -99) < thr: best_e = cur
-        alloc = min(1.0, max(0.0, ps * (0.5 if neg else 1.0)))
-        target = {best_e: alloc}
-        if target != pos:
-            apply_trade(target)
-            trail[best_e] = assets.get(best_e, portfolio_history)[i]
+with st.spinner("Lade Marktdaten …"):
+    sig = compute_signal()
 
-# ── 4. PERFORMANCE EVALUATION ─────────────────────────────────────────────
-print("4/4: Berechne Performance-Kennzahlen...\n")
+if sig is None:
+    st.error("⚠️ Daten nicht verfügbar. Bitte später erneut versuchen.")
+    st.stop()
 
-years = (N - 1) / 252.0
-final_cagr = (portfolio_history[-1] / portfolio_history[0]) ** (1 / years) - 1
-daily_returns = portfolio_history[1:] / portfolio_history[:-1] - 1
-sharpe_ratio = (daily_returns.mean() - 0.02 / 252) / daily_returns.std() * np.sqrt(252)
-drawdown = portfolio_history / np.maximum.accumulate(portfolio_history) - 1
-max_drawdown = drawdown.min()
+st.caption(f"Stand: {sig['date'].strftime('%A, %d.%m.%Y')}  ·  "
+           f"Aktualisiert: {datetime.now().strftime('%H:%M')}")
 
-print("=" * 60)
-print("     LEVERAGED ETF SYSTEM - NEUE BASELINE (11 / 48)")
-print("=" * 60)
-print(f" Testzeitraum:          {START_DATE} bis {END_DATE} ({years:.1f} Jahre)")
-print(f" Lookback-Fenster:      Fast = 11 Tage (75%) | Slow = 48 Tage (25%)")
-print("-" * 60)
-print(f" CAGR (Jahresrendite):  {final_cagr * 100:.2f}%")
-print(f" Sharpe Ratio:          {sharpe_ratio:.3f}")
-print(f" Maximaler Drawdown:    {max_drawdown * 100:.2f}%")
-print("=" * 60)
+st.divider()
+
+# ── HAUPT-STATUS ───────────────────────────────────────────────────────────
+if sig["is_bull"] and not sig["hurst_chop"]:
+    st.success(f"### 🟢 BULL — {sig['best']} kaufen\n"
+               f"Allokation: **{sig['dyn_pos']:.0%}** des Portfolios")
+elif sig["is_bull"] and sig["hurst_chop"]:
+    st.warning(f"### 🟡 BULL + CHOP — QQQ (1×) kaufen\n"
+               f"Hurst-Ensemble: Chop aktiv → kein Hebel-ETF  "
+               f"({sig['dyn_pos']:.0%} Portfolio)")
+else:
+    reasons = []
+    if not sig["px_bull"]: reasons.append(f"Preis unter SMA{SMA_PERIOD}")
+    if sig["credit_stress"]: reasons.append("Kredit-Veto")
+    st.error(f"### 🔴 BEAR — Cash halten\nGrund: {', '.join(reasons)}")
+
+st.divider()
+
+# ── KENNZAHLEN ─────────────────────────────────────────────────────────────
+c1, c2 = st.columns(2)
+with c1:
+    st.metric("QQQ", f"${sig['qqq_now']:.2f}",
+              f"{(sig['qqq_now']/sig['sma_now']-1)*100:+.1f}% vs SMA{SMA_PERIOD}")
+with c2:
+    st.metric("VIX", f"{sig['vix_now']:.1f}")
+
+c3, c4 = st.columns(2)
+with c3:
+    st.metric("ATR-Regime", sig["atr_regime"], f"ATR {sig['atr_now']:.2f}%")
+with c4:
+    st.metric("DynStop", f"{int(sig['stop_pct']*100)}% ({sig['stop_regime']})",
+              f"DynPos {sig['dyn_pos']:.0%}")
+
+st.divider()
+
+# ── HURST-ENSEMBLE ─────────────────────────────────────────────────────────
+st.subheader("🌊 Hurst-Ensemble")
+st.caption(f"AND-Logik: w{HURST_W1}/t{HURST_T1} UND w{HURST_W2}/t{HURST_T2}")
+
+hc1, hc2, hc3 = st.columns(3)
+with hc1:
+    delta1 = f"< {HURST_T1} → Chop" if sig["h1"] < HURST_T1 else f"≥ {HURST_T1} → Trend"
+    st.metric(f"H{HURST_W1} (lang)", f"{sig['h1']:.3f}", delta1)
+with hc2:
+    delta2 = f"< {HURST_T2} → Chop" if sig["h2"] < HURST_T2 else f"≥ {HURST_T2} → Trend"
+    st.metric(f"H{HURST_W2} (kurz)", f"{sig['h2']:.3f}", delta2)
+with hc3:
+    if sig["hurst_chop"]:
+        st.markdown("**Ensemble:**\n🟡 CHOP AKTIV")
+    else:
+        st.markdown("**Ensemble:**\n🟢 Trend intakt")
+
+st.divider()
+
+# ── KREDIT-SIGNAL ──────────────────────────────────────────────────────────
+st.subheader("🏦 Kredit-Signal (HYG/IEF)")
+st.caption(f"MA{CREDIT_MA} × {1-CREDIT_DEPTH:.3f} — Kreditstress = Bull-Veto")
+
+if sig["credit_ok"]:
+    cc1, cc2 = st.columns(2)
+    with cc1:
+        st.metric("HYG/IEF Ratio", f"{sig['ratio_now']:.4f}",
+                  f"{sig['credit_dist']:+.2f}% vs. Schwelle")
+    with cc2:
+        if sig["credit_stress"]:
+            st.markdown("**Status:** 🔴 STRESS — Bull-Veto aktiv")
+        else:
+            st.markdown("**Status:** 🟢 Kein Stress")
+    st.caption(f"MA{CREDIT_MA}: {sig['ma_now']:.4f}  ·  "
+               f"Schwelle: {sig['ma_now']*(1-CREDIT_DEPTH):.4f}")
+else:
+    st.info("HYG/IEF nicht verfügbar — Signal neutral")
+
+st.divider()
+
+# ── MOMENTUM-SCORES ────────────────────────────────────────────────────────
+st.subheader("📈 Momentum-Scores")
+lb_fast, lb_slow = MTF_WINDOWS
+rows = []
+for rank, (name, score) in enumerate(sig["ranked"], 1):
+    if name not in sig["etf_close"]: continue
+    s   = sig["etf_close"][name]; p = float(s.iloc[-1])
+    
+    # Dynamischer / sicherer Zugriff auf die Exakten Lookbacks
+    d_fast = (p / float(s.iloc[-1 - lb_fast]) - 1) * 100 if len(s) > lb_fast else 0.0
+    d_slow = (p / float(s.iloc[-1 - lb_slow]) - 1) * 100 if len(s) > lb_slow else 0.0
+    
+    marker = "👑" if name == sig["best"] else ""
+    rows.append({
+        "Rang": rank, 
+        "ETF": f"{marker} {name}",
+        "Score": f"{score:+.4f}", 
+        "Kurs": f"${p:.2f}",
+        f"{lb_fast}d": f"{d_fast:+.1f}%", 
+        f"{lb_slow}d": f"{d_slow:+.1f}%"
+    })
+st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+st.divider()
+
+# ── TRAILING STOPS ─────────────────────────────────────────────────────────
+st.subheader("🛑 Trailing Stops (SOXL / FNGU)")
+st.caption(f"Peak seit Bull-Entry: {sig['last_entry'].strftime('%d.%m.%Y')}")
+
+for name, info in sig["stops"].items():
+    if info is None: continue
+    with st.container(border=True):
+        st.markdown(f"**{name}**")
+        s1, s2, s3 = st.columns(3)
+        with s1: st.metric("Peak",    f"${info['peak']:.2f}")
+        with s2: st.metric("Aktuell", f"${info['cur']:.2f}")
+        with s3: st.metric("Stop",    f"${info['stop']:.2f}")
+        if info["stopped"]:
+            st.error(f"⚠️ UNTER STOP! Re-Entry erst ab ${info['reentry']:.2f}")
+        else:
+            st.success(f"✅ Puffer: {info['dist']*100:+.1f}%")
+
+st.divider()
+st.caption(
+    f"SMA{SMA_PERIOD} · ATR-lo/hi {ATR_LO}/{ATR_HI}% · "
+    f"DynStop {int(DS_STOP_LO*100)}/{int(DS_STOP_MID*100)}/{int(DS_STOP_HI*100)}% "
+    f"@ {DS_ATR_LO}/{DS_ATR_HI}% · "
+    f"Hurst w{HURST_W1}/t{HURST_T1} AND w{HURST_W2}/t{HURST_T2} · "
+    f"Credit ma{CREDIT_MA}/d{CREDIT_DEPTH*100:.1f}% · "
+    f"DynPos {DYN_BASE} · Dip {int(DIP_TRIGGER*100)}%/{int(DIP_ALLOC*100)}%"
+)
+st.caption("⚠️ Keine Anlageberatung. Nur für private Nutzung.")
