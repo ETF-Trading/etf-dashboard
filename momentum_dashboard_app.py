@@ -4,7 +4,7 @@ Finale Baseline: SMA55 | DynStop | DipAlloc100% | DynPos 0.022
                Hurst-Ensemble w100/t0.50 AND w30/t0.46
                Credit-Veto HYG/IEF ma50/d2.5%
                atr_lo=2.5% | atr_hi=5.5%
-               Momentum-Rotation: 10/21/63 mit (0.50, 0.30, 0.20)
+               Momentum-Rotation: 12/50 Tage mit (0.70, 0.30)
 """
 
 import streamlit as st
@@ -39,9 +39,9 @@ LOCK_RECOV   = 0.08
 DIP_TRIGGER  = 0.42
 DIP_ALLOC    = 1.00
 
-# Neue Baseline Momentum-Gewichtung
-MTF_WINDOWS  = (10, 21, 63)
-MTF_WEIGHTS  = (0.50, 0.30, 0.20)
+# Neue Sieger-Baseline Momentum-Gewichtung (12/50)
+MTF_WINDOWS  = (12, 50)
+MTF_WEIGHTS  = (0.70, 0.30)
 
 HURST_W1, HURST_T1 = 100, 0.50
 HURST_W2, HURST_T2 = 30, 0.46
@@ -56,7 +56,8 @@ UNIVERSE = ["TQQQ", "SOXL", "FNGU", "UPRO"]
 @st.cache_data(ttl=3600)
 def load_data():
     end   = datetime.today()
-    start = end - timedelta(days=450)
+    # Erweitert auf 730 Tage (2 Jahre), damit Trailing-Stops seit Bull-Entry stabil laufen
+    start = end - timedelta(days=730)
 
     def dl(ticker):
         try:
@@ -184,21 +185,33 @@ def compute_signal():
     ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
     best   = ranked[0][0] if ranked else "TQQQ"
 
-    # Trailing Stop
-    above       = qqq >= sma
-    cross       = above & ~above.shift(1).fillna(False)
+    # Korrigierte Trailing-Stop-Logik
+    above        = qqq >= sma
+    cross        = above & ~above.shift(1).fillna(False)
     bull_entries = cross[cross].index
     last_entry   = bull_entries[-1] if len(bull_entries) > 0 else qqq.index[0]
 
     def calc_stop(name):
         if name not in etf_close: return None
-        s     = etf_close[name]
-        since = s.loc[last_entry:] if last_entry in s.index else s.tail(252)
-        peak  = float(since.max()); peak_d = since.idxmax()
-        cur   = float(s.iloc[-1]); stop = peak * (1 - stop_pct)
+        s = etf_close[name].dropna()
+        if s.empty: return None
+
+        # Filtere historisches Fenster ab Bullenmarkt-Eintritt
+        since = s.loc[s.index >= last_entry]
+        if since.empty:
+            since = s.tail(126) # Fallback
+
+        peak     = float(since.max())
+        peak_d   = since.idxmax()
+        cur      = float(s.iloc[-1])
+        stop     = peak * (1 - stop_pct)
+        dist     = (cur - stop) / cur if cur > 0 else 0
+        stopped  = cur < stop
+        reentry  = stop * (1 + LOCK_RECOV)
+
         return {"cur": cur, "peak": peak, "peak_date": peak_d,
-                "stop": stop, "dist": (cur - stop) / cur,
-                "stopped": cur < stop, "reentry": stop * (1 + LOCK_RECOV)}
+                "stop": stop, "dist": dist,
+                "stopped": stopped, "reentry": reentry}
 
     return dict(
         date=date, qqq_now=qqq_now, sma_now=sma_now,
@@ -314,13 +327,12 @@ rows = []
 for rank, (name, score) in enumerate(sig["ranked"], 1):
     if name not in sig["etf_close"]: continue
     s   = sig["etf_close"][name]; p = float(s.iloc[-1])
-    d10 = (p/float(s.iloc[-11])-1)*100 if len(s)>10 else 0
-    d21 = (p/float(s.iloc[-22])-1)*100 if len(s)>21 else 0
-    d63 = (p/float(s.iloc[-64])-1)*100 if len(s)>63 else 0
+    d12 = (p/float(s.iloc[-13])-1)*100 if len(s)>12 else 0
+    d50 = (p/float(s.iloc[-51])-1)*100 if len(s)>50 else 0
     marker = "👑" if name == sig["best"] else ""
     rows.append({"Rang": rank, "ETF": f"{marker} {name}",
                  "Score": f"{score:+.4f}", "Kurs": f"${p:.2f}",
-                 "10d": f"{d10:+.1f}%", "21d": f"{d21:+.1f}%", "63d": f"{d63:+.1f}%"})
+                 "12d": f"{d12:+.1f}%", "50d": f"{d50:+.1f}%"})
 st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
 st.divider()
