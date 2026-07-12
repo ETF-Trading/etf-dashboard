@@ -4,6 +4,7 @@ Finale Baseline: SMA55 | DynStop | DipAlloc100% | DynPos 0.022
                Hurst-Ensemble w100/t0.50 AND w30/t0.46
                Credit-Veto HYG/IEF ma50/d2.5%
                atr_lo=2.5% | atr_hi=5.5%
+               Momentum-Rotation: 10/21/63 mit (0.50, 0.30, 0.20)
 """
 
 import streamlit as st
@@ -38,8 +39,9 @@ LOCK_RECOV   = 0.08
 DIP_TRIGGER  = 0.42
 DIP_ALLOC    = 1.00
 
+# Neue Baseline Momentum-Gewichtung
 MTF_WINDOWS  = (10, 21, 63)
-MTF_WEIGHTS  = (0.40, 0.40, 0.20)
+MTF_WEIGHTS  = (0.50, 0.30, 0.20)
 
 HURST_W1, HURST_T1 = 100, 0.50
 HURST_W2, HURST_T2 = 30, 0.46
@@ -311,7 +313,7 @@ st.subheader("📈 Momentum-Scores")
 rows = []
 for rank, (name, score) in enumerate(sig["ranked"], 1):
     if name not in sig["etf_close"]: continue
-    s  = sig["etf_close"][name]; p = float(s.iloc[-1])
+    s   = sig["etf_close"][name]; p = float(s.iloc[-1])
     d10 = (p/float(s.iloc[-11])-1)*100 if len(s)>10 else 0
     d21 = (p/float(s.iloc[-22])-1)*100 if len(s)>21 else 0
     d63 = (p/float(s.iloc[-64])-1)*100 if len(s)>63 else 0
